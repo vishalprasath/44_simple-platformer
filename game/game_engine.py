@@ -2,6 +2,7 @@ import pygame
 from .player import Player
 from .platform import Platform
 from .hazard import Hazard
+from .sounds import Sounds
 
 # Game Engine
 
@@ -10,14 +11,21 @@ BROWN = (150, 100, 60)
 RED = (220, 60, 60)
 GREEN = (0, 200, 0)
 
+# Gravity / jump strength for each difficulty. Medium is the original
+# physics; every setting was checked to still allow reaching the goal.
+DIFFICULTIES = {
+    "Easy":   {"gravity": 0.45, "jump_strength": -11},
+    "Medium": {"gravity": 0.6,  "jump_strength": -12},
+    "Hard":   {"gravity": 0.9,  "jump_strength": -15},
+}
+DIFFICULTY_KEYS = {pygame.K_1: "Easy", pygame.K_2: "Medium", pygame.K_3: "Hard"}
+
 class GameEngine:
     def __init__(self, width, height):
         self.width = width
         self.height = height
-        self.gravity = 0.6
 
         self.start_x, self.start_y = 40, height - 120
-        self.player = Player(self.start_x, self.start_y)
 
         # A simple hand-built level: platforms with gaps between them
         # (falling into a gap means falling off the bottom of the
@@ -32,12 +40,34 @@ class GameEngine:
         self.hazards = [Hazard(240, ground_y - 14, 100)]
         self.goal_x = 740
 
-        self.score = 0
         self.font = pygame.font.SysFont("Arial", 30)
+        self.big_font = pygame.font.SysFont("Arial", 64, bold=True)
+        self.quit_requested = False
+        self.sounds = Sounds()
+        self.reset("Medium")
+
+    def reset(self, difficulty):
+        # Start a fresh game with the chosen difficulty's physics
+        settings = DIFFICULTIES[difficulty]
+        self.difficulty = difficulty
+        self.gravity = settings["gravity"]
+        self.player = Player(self.start_x, self.start_y)
+        self.player.jump_strength = settings["jump_strength"]
+        self.score = 0
         self.game_over = False
 
     def handle_event(self, event):
+        if self.game_over:
+            # On the Game Over screen: 1/2/3 replays at that difficulty, Esc exits.
+            if event.type == pygame.KEYDOWN:
+                if event.key in DIFFICULTY_KEYS:
+                    self.reset(DIFFICULTY_KEYS[event.key])
+                elif event.key == pygame.K_ESCAPE:
+                    self.quit_requested = True
+            return
         if event.type == pygame.KEYDOWN and event.key in (pygame.K_SPACE, pygame.K_UP, pygame.K_w):
+            if self.player.on_ground:  # only beep when the jump actually happens
+                self.sounds.play("jump")
             self.player.jump()
 
     def handle_input(self):
@@ -55,35 +85,43 @@ class GameEngine:
         self.player.vy += self.gravity
         self.player.x = max(0, self.player.x + self.player.vx)
 
-        # NOTE: gravity has no terminal-velocity cap, so vertical speed
-        # keeps growing the longer the player falls. Collision is only
-        # checked against the player's rect *after* it has already
-        # moved for the frame - there's no check for whether the
-        # player's path crossed a platform along the way. After a
-        # long enough fall (e.g. off the elevated middle platform),
-        # a single frame's movement can carry the player from just
-        # above a platform to just below it without the two rects
-        # ever overlapping, so the platform is skipped entirely and
-        # the player falls straight through. See Task 1 in the README.
+        # Swept landing check: rather than only testing for overlap
+        # after the move (which a fast fall can skip over entirely),
+        # land on a platform if the player's feet were at or above its
+        # top last frame and are at or below it now. This catches the
+        # crossing at any fall speed. If several platforms were crossed
+        # in one frame, land on the highest one (the first one hit).
+        prev_bottom = self.player.y + self.player.height
         self.player.y += self.player.vy
+        new_bottom = self.player.y + self.player.height
         self.player.on_ground = False
-        for platform in self.platforms:
-            if self.player.rect().colliderect(platform.rect()) and self.player.vy >= 0:
-                self.player.y = platform.y - self.player.height
+        if self.player.vy >= 0:
+            landing = None
+            for platform in self.platforms:
+                overlaps_x = (self.player.x < platform.x + platform.width and
+                              self.player.x + self.player.width > platform.x)
+                if overlaps_x and prev_bottom <= platform.y <= new_bottom:
+                    if landing is None or platform.y < landing.y:
+                        landing = platform
+            if landing is not None:
+                self.player.y = landing.y - self.player.height
                 self.player.vy = 0
                 self.player.on_ground = True
 
         for hazard in self.hazards:
             if self.player.rect().colliderect(hazard.rect()):
                 self.game_over = True
+                self.sounds.play("death")
                 return
 
         if self.player.y > self.height:
             self.game_over = True
+            self.sounds.play("death")
             return
 
         if self.player.x >= self.goal_x:
             self.score += 1
+            self.sounds.play("goal")
             self.player.x, self.player.y = self.start_x, self.start_y
             self.player.vy = 0
 
@@ -98,10 +136,25 @@ class GameEngine:
 
         pygame.draw.rect(screen, WHITE, self.player.rect())
 
-        score_text = self.font.render(f"Score: {self.score}", True, WHITE)
+        score_text = self.font.render(f"Score: {self.score}   {self.difficulty}", True, WHITE)
         screen.blit(score_text, (10, 10))
 
-        if self.game_over and not getattr(self, "_game_over_logged", False):
-            # NOTE: no proper game-over screen yet - see Task 2 in the README.
-            print("Game over! Final score:", self.score)
-            self._game_over_logged = True
+        if self.game_over:
+            self.render_game_over(screen)
+
+    def render_game_over(self, screen):
+        # Dim the frozen game scene behind the message
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        screen.blit(overlay, (0, 0))
+
+        cx, cy = self.width // 2, self.height // 2
+        lines = [
+            (self.big_font, "GAME OVER", RED, cy - 90),
+            (self.font, f"Final score: {self.score}  ({self.difficulty})", WHITE, cy - 20),
+            (self.font, "Play again:  1 Easy   2 Medium   3 Hard", WHITE, cy + 35),
+            (self.font, "Esc to quit", WHITE, cy + 80),
+        ]
+        for font, text, color, y in lines:
+            surface = font.render(text, True, color)
+            screen.blit(surface, surface.get_rect(center=(cx, y)))
